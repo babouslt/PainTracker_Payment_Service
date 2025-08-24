@@ -6,7 +6,8 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
   apiVersion: "2023-10-16",
 });
 
-const BDD_API_URL = process.env.BDD_API_URL || "http://localhost:3004/api";
+const BDD_SERVICE_URL =
+  process.env.BDD_SERVICE_URL || "http://localhost:3004/api";
 
 export async function handleWebhook(req: Request, res: Response) {
   const sig = req.headers["stripe-signature"];
@@ -184,7 +185,7 @@ async function handleInvoicePaymentFailed(invoice: Stripe.Invoice) {
 // Fonctions utilitaires pour communiquer avec le BDDService
 async function updateUserPremiumStatus(userId: string, isPremium: boolean) {
   try {
-    const response = await fetch(`${BDD_API_URL}/users/${userId}`, {
+    const response = await fetch(`${BDD_SERVICE_URL}/users/${userId}`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
