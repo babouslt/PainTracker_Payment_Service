@@ -1,28 +1,38 @@
 import request from "supertest";
 import express from "express";
-import {
-  createSubscriptionController,
-  handleSubscriptionWebhook,
-} from "../../controllers/subscription.controller";
 
 // Mock des modules externes
-jest.mock("../../utils/stripe", () => ({
-  createCustomer: jest.fn(),
-  createProduct: jest.fn(),
-  createPrice: jest.fn(),
-  createSubscription: jest.fn(),
-  cancelSubscription: jest.fn(),
-  retrieveSubscription: jest.fn(),
-  constructWebhookEvent: jest.fn(),
-}));
-
-jest.mock("../../utils/userService", () => ({
-  updateUserToPremium: jest.fn(),
-  removeUserFromPremium: jest.fn(),
+jest.mock("../../models/subscription.model", () => ({
+  Subscription: Object.assign(
+    jest.fn().mockImplementation(() => ({
+      save: jest.fn().mockResolvedValue({}),
+    })),
+    {
+      findOneAndUpdate: jest.fn().mockResolvedValue({}),
+    }
+  ),
 }));
 
 // Mock de fetch global
 global.fetch = jest.fn();
+
+// Mock de Stripe - Mock complet du module
+const mockConstructEvent = jest.fn();
+const mockRetrieveSubscription = jest.fn();
+
+jest.mock("stripe", () => {
+  return jest.fn().mockImplementation(() => ({
+    webhooks: {
+      constructEvent: mockConstructEvent,
+    },
+    subscriptions: {
+      retrieve: mockRetrieveSubscription,
+    },
+  }));
+});
+
+// Import après le mock
+import { handleWebhook } from "../../controllers/subscription.controller";
 
 describe("Subscription Controller", () => {
   let app: express.Application;
@@ -31,102 +41,90 @@ describe("Subscription Controller", () => {
     app = express();
     app.use(express.json());
 
-    // Routes de test
-    app.post("/subscriptions/create", createSubscriptionController);
-    app.post("/webhook", handleSubscriptionWebhook);
+    // Route de test
+    app.post("/webhook", handleWebhook);
 
     // Reset des mocks
     jest.clearAllMocks();
+
+    // Configuration par défaut pour les tests
+    process.env.STRIPE_WEBHOOK_SECRET = "test_secret";
+    process.env.STRIPE_SECRET_KEY = "test_key";
   });
 
-  describe("POST /subscriptions", () => {
-    it("should create a subscription successfully", async () => {
-      const mockCustomer = { id: "cus_test123" };
-      const mockProduct = { id: "prod_test123" };
-      const mockPrice = { id: "price_test123" };
-      const mockSubscription = {
-        id: "sub_test123",
-        status: "incomplete",
-        latest_invoice: {
-          payment_intent: { client_secret: "pi_test_secret" },
-        },
-      };
-
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.createCustomer.mockResolvedValue(mockCustomer);
-      stripeUtils.createProduct.mockResolvedValue(mockProduct);
-      stripeUtils.createPrice.mockResolvedValue(mockPrice);
-      stripeUtils.createSubscription.mockResolvedValue(mockSubscription);
-
-      (global.fetch as jest.Mock).mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ success: true }),
-      });
-
-      const response = await request(app).post("/subscriptions/create").send({
-        userId: "507f1f77bcf86cd799439011",
-        email: "test@example.com",
-        amount: 6.99,
-        currency: "eur",
-      });
-
-      expect(response.status).toBe(201);
-      expect(response.body.success).toBe(true);
-      expect(response.body.data.subscriptionId).toBe("sub_test123");
-      expect(response.body.data.clientSecret).toBe("pi_test_secret");
-    });
-
-    it("should return 400 if userId is missing", async () => {
-      const response = await request(app).post("/subscriptions/create").send({
-        email: "test@example.com",
-        amount: 6.99,
-      });
-
-      expect(response.status).toBe(400);
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain("userId et email sont requis");
-    });
-
-    it("should return 400 if email is missing", async () => {
-      const response = await request(app).post("/subscriptions/create").send({
-        userId: "507f1f77bcf86cd799439011",
-        amount: 6.99,
-      });
-
-      expect(response.status).toBe(400);
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain("userId et email sont requis");
-    });
-
-    it("should handle Stripe errors gracefully", async () => {
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.createCustomer.mockRejectedValue(
-        new Error("Stripe API error")
-      );
-
-      const response = await request(app).post("/subscriptions/create").send({
-        userId: "507f1f77bcf86cd799439011",
-        email: "test@example.com",
-      });
-
-      expect(response.status).toBe(500);
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain(
-        "Erreur lors de la création de l'abonnement"
-      );
-    });
+  afterEach(() => {
+    // Restaurer l'environnement
+    delete process.env.STRIPE_WEBHOOK_SECRET;
+    delete process.env.STRIPE_SECRET_KEY;
   });
 
   describe("POST /webhook", () => {
+    it("should return 400 if webhook secret is not configured", async () => {
+      // Simuler l'absence de webhook secret
+      delete process.env.STRIPE_WEBHOOK_SECRET;
+
+      const response = await request(app)
+        .post("/webhook")
+        .send({})
+        .set("stripe-signature", "test_signature")
+        .set("Content-Type", "application/json");
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe("Webhook secret not configured");
+    });
+
     it("should return 400 if stripe signature is missing", async () => {
+      // Configurer le mock pour qu'il lève une erreur quand il n'y a pas de signature
+      mockConstructEvent.mockImplementation(() => {
+        throw new Error("No signature provided");
+      });
+
       const response = await request(app)
         .post("/webhook")
         .send({})
         .set("Content-Type", "application/json");
 
       expect(response.status).toBe(400);
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain("Signature Stripe manquante");
+      expect(response.body.error).toContain("Webhook Error");
+    });
+
+    it("should handle checkout.session.completed event", async () => {
+      const mockEvent = {
+        type: "checkout.session.completed",
+        data: {
+          object: {
+            id: "cs_test123",
+            mode: "subscription",
+            subscription: "sub_test123",
+            metadata: { userId: "507f1f77bcf86cd799439011" },
+          },
+        },
+      };
+
+      mockConstructEvent.mockReturnValue(mockEvent);
+      mockRetrieveSubscription.mockResolvedValue({
+        id: "sub_test123",
+        metadata: { userId: "507f1f77bcf86cd799439011" },
+        customer: "cus_test123",
+        items: { data: [{ price: { id: "price_test123" } }] },
+        status: "active",
+        current_period_start: 1234567890,
+        current_period_end: 1234567890,
+      });
+
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ success: true }),
+      });
+
+      const response = await request(app)
+        .post("/webhook")
+        .send({})
+        .set("stripe-signature", "test_signature")
+        .set("Content-Type", "application/json");
+
+      expect(response.status).toBe(200);
+      expect(response.body.received).toBe(true);
     });
 
     it("should handle customer.subscription.created event", async () => {
@@ -136,15 +134,30 @@ describe("Subscription Controller", () => {
           object: {
             id: "sub_test123",
             metadata: { userId: "507f1f77bcf86cd799439011" },
-            status: "active",
             customer: "cus_test123",
             items: { data: [{ price: { id: "price_test123" } }] },
+            status: "active",
+            current_period_start: 1234567890,
+            current_period_end: 1234567890,
           },
         },
       };
 
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.constructWebhookEvent.mockReturnValue(mockEvent);
+      mockConstructEvent.mockReturnValue(mockEvent);
+      mockRetrieveSubscription.mockResolvedValue({
+        id: "sub_test123",
+        metadata: { userId: "507f1f77bcf86cd799439011" },
+        customer: "cus_test123",
+        items: { data: [{ price: { id: "price_test123" } }] },
+        status: "active",
+        current_period_start: 1234567890,
+        current_period_end: 1234567890,
+      });
+
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ success: true }),
+      });
 
       const response = await request(app)
         .post("/webhook")
@@ -164,12 +177,25 @@ describe("Subscription Controller", () => {
             id: "sub_test123",
             metadata: { userId: "507f1f77bcf86cd799439011" },
             status: "active",
+            current_period_start: 1234567890,
+            current_period_end: 1234567890,
           },
         },
       };
 
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.constructWebhookEvent.mockReturnValue(mockEvent);
+      mockConstructEvent.mockReturnValue(mockEvent);
+      mockRetrieveSubscription.mockResolvedValue({
+        id: "sub_test123",
+        metadata: { userId: "507f1f77bcf86cd799439011" },
+        status: "active",
+        current_period_start: 1234567890,
+        current_period_end: 1234567890,
+      });
+
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ success: true }),
+      });
 
       const response = await request(app)
         .post("/webhook")
@@ -181,19 +207,29 @@ describe("Subscription Controller", () => {
       expect(response.body.received).toBe(true);
     });
 
-    it("should handle customer.subscription.deleted event", async () => {
+    it("should handle invoice.payment_succeeded event", async () => {
       const mockEvent = {
-        type: "customer.subscription.deleted",
+        type: "invoice.payment_succeeded",
         data: {
           object: {
-            id: "sub_test123",
-            metadata: { userId: "507f1f77bcf86cd799439011" },
+            id: "in_test123",
+            subscription: "sub_test123",
           },
         },
       };
 
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.constructWebhookEvent.mockReturnValue(mockEvent);
+      mockConstructEvent.mockReturnValue(mockEvent);
+      mockRetrieveSubscription.mockResolvedValue({
+        id: "sub_test123",
+        metadata: { userId: "507f1f77bcf86cd799439011" },
+        customer: "cus_test123",
+        status: "active",
+      });
+
+      (global.fetch as jest.Mock).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ success: true }),
+      });
 
       const response = await request(app)
         .post("/webhook")
@@ -211,8 +247,7 @@ describe("Subscription Controller", () => {
         data: { object: {} },
       };
 
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.constructWebhookEvent.mockReturnValue(mockEvent);
+      mockConstructEvent.mockReturnValue(mockEvent);
 
       const response = await request(app)
         .post("/webhook")
@@ -225,8 +260,7 @@ describe("Subscription Controller", () => {
     });
 
     it("should handle webhook construction errors", async () => {
-      const stripeUtils = require("../../utils/stripe");
-      stripeUtils.constructWebhookEvent.mockImplementation(() => {
+      mockConstructEvent.mockImplementation(() => {
         throw new Error("Invalid signature");
       });
 
@@ -237,10 +271,7 @@ describe("Subscription Controller", () => {
         .set("Content-Type", "application/json");
 
       expect(response.status).toBe(400);
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain(
-        "Erreur lors du traitement du webhook"
-      );
+      expect(response.body.error).toContain("Webhook Error: Invalid signature");
     });
   });
 });
