@@ -27,7 +27,7 @@ app.options("*", cors());
 
 // Middleware pour les webhooks Stripe (body brut)
 app.use(
-  "/api/subscriptions/webhook",
+  "/api/subscription/webhook",
   bodyParser.raw({ type: "application/json" })
 );
 

@@ -4,6 +4,6 @@ import subscriptionRoutes from "./subscription.route";
 const router = Router();
 
 // Routes d'abonnement
-router.use("/subscriptions", subscriptionRoutes);
+router.use("/subscription", subscriptionRoutes);
 
 export default router;
